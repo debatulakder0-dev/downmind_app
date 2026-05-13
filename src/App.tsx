@@ -121,7 +121,7 @@ export default function App() {
 
     setStatus("thinking");
     try {
-      // 1. Chat (Direct OpenRouter)
+      // 1. Chat (Direct Gemini)
       const companion = COMPANIONS[profile!.companion];
       const personaGuidelines = profile!.companion === "Mala" 
         ? "Mala is warm, caring, and soothing. She speaks like a gentle older sister or a kind mentor. She prioritizes mental wellbeing and gentle encouragement. Use poses: idle, wave (greeting), thumbsup (affirmation), remind (task focus)."
@@ -148,26 +148,30 @@ export default function App() {
         - Output ONLY valid JSON in this format: {"text": "...", "pose": "...", "action": "...", "todoUpdate": ["task1", "task2"]}
       `;
       
-      const chatResRaw = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://dawnmind.vercel.app",
-          "X-Title": "DawnMind"
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-3.3-70b-instruct:free",
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: transcript }
-          ],
-          max_tokens: 200
-        })
-      });
+      const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
 
-      const chatData = await chatResRaw.json();
-      let content = chatData.choices[0].message.content;
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: systemPrompt + "\n\nUser says: " + transcript }]
+              }
+            ],
+            generationConfig: { 
+              maxOutputTokens: 200,
+              temperature: 0.8
+            }
+          })
+        }
+      );
+
+      const data = await response.json();
+      const content = data.candidates[0].content.parts[0].text;
       
       // Resilient JSON parsing
       let aiRes: AIResponse;
