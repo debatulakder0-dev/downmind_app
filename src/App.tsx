@@ -7,7 +7,14 @@ import { MicButton } from "./components/MicButton";
 import { TodoList } from "./components/TodoList";
 import { UserProfile, AppStatus, TodoItem, AIResponse } from "./types";
 import { COMPANIONS } from "./constants";
-import axios from "axios";
+
+// Type definitions for SpeechRecognition if needed (some browsers don't have it in @types/node)
+declare global {
+  interface Window {
+    SpeechRecognition: any;
+    webkitSpeechRecognition: any;
+  }
+}
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
@@ -15,11 +22,8 @@ export default function App() {
   const [pose, setPose] = useState<string>("idle");
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [loopActive, setLoopActive] = useState(false);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
-  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const recognitionRef = useRef<any>(null);
 
   // Load from local storage
   useEffect(() => {
@@ -45,117 +49,142 @@ export default function App() {
     saveTodos(newTodos);
   };
 
-  const startVoiceLoop = async () => {
+  const startVoiceLoop = () => {
     if (loopActive) {
       stopVoiceLoop();
       return;
     }
     setLoopActive(true);
-    await startListening();
+    startListening();
   };
 
   const stopVoiceLoop = () => {
     setLoopActive(false);
     setStatus("idle");
     setPose("idle");
-    if (mediaRecorderRef.current) mediaRecorderRef.current.stop();
+    if (recognitionRef.current) {
+      recognitionRef.current.onend = null;
+      recognitionRef.current.stop();
+    }
     if (audioPlayerRef.current) audioPlayerRef.current.pause();
-    if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
   };
 
-  const startListening = async () => {
+  const startListening = () => {
     if (!loopActive && status !== "idle") return;
+    
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Voice recognition is not supported in this browser.");
+      setLoopActive(false);
+      return;
+    }
+
     setStatus("listening");
     setPose("idle");
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+    recognition.lang = "en-US";
+    recognition.continuous = false;
+    recognition.interimResults = false;
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
-      };
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      processUserInput(transcript);
+    };
 
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/wav" });
-        await processVoice(audioBlob);
-      };
+    recognition.onerror = (event: any) => {
+      console.error("Speech recognition error", event.error);
+      if (loopActive) {
+        setTimeout(startListening, 1000);
+      } else {
+        setStatus("idle");
+      }
+    };
 
-      mediaRecorder.start();
+    recognition.onend = () => {
+      if (status === "listening" && loopActive) {
+        // If it ended without result and we are still in loop, restart
+        setTimeout(startListening, 100);
+      }
+    };
 
-      // Silence detection (1.5 seconds)
-      const audioContext = new AudioContext();
-      audioContextRef.current = audioContext;
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyzer = audioContext.createAnalyser();
-      source.connect(analyzer);
-
-      const bufferLength = analyzer.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-      
-      const checkSilence = () => {
-        if (status !== "listening") return;
-        analyzer.getByteFrequencyData(dataArray);
-        const volume = dataArray.reduce((a, b) => a + b) / bufferLength;
-        
-        if (volume < 5) { // Threshold for silence
-          if (!silenceTimeoutRef.current) {
-            silenceTimeoutRef.current = setTimeout(() => {
-              if (mediaRecorderRef.current?.state === "recording") {
-                mediaRecorderRef.current.stop();
-                stream.getTracks().forEach(t => t.stop());
-              }
-            }, 1500);
-          }
-        } else {
-          if (silenceTimeoutRef.current) {
-            clearTimeout(silenceTimeoutRef.current);
-            silenceTimeoutRef.current = null;
-          }
-        }
-        
-        if (status === "listening") requestAnimationFrame(checkSilence);
-      };
-
-      checkSilence();
-    } catch (err) {
-      console.error("Mic error:", err);
-      // Fallback: use Web Speech API or just alert
-      alert("Microphone access denied. Please enable it for DawnMind.");
-      setLoopActive(false);
-      setStatus("idle");
-    }
+    recognition.start();
   };
 
-  const processVoice = async (blob: Blob) => {
+  const processUserInput = async (transcript: string) => {
+    if (!transcript || transcript.length < 2) {
+      if (loopActive) startListening();
+      else setStatus("idle");
+      return;
+    }
+
     setStatus("thinking");
     try {
-      // 1. STT (using ElevenLabs STT)
-      const sttResponse = await axios.post("/api/stt", blob, {
-        headers: { "Content-Type": "audio/wav" }
-      });
-      const transcript = sttResponse.data.text;
-
-      if (!transcript || transcript.length < 2) {
-        if (loopActive) startListening();
-        else setStatus("idle");
-        return;
-      }
-
-      // 2. Chat (Groq)
+      // 1. Chat (Direct OpenRouter)
       const companion = COMPANIONS[profile!.companion];
-      const systemPrompt = `You are ${companion.name}. User is ${profile!.name}, ${profile!.occupation}, wakes at ${profile!.wakeTime}, peak work at ${profile!.peakTime}, ${profile!.relationship}, wants ${profile!.reminderStyle} reminders. Current time: ${new Date().toLocaleTimeString()}. Todos: ${todos.map(t => t.text).join(", ")}. Keep responses to 2-3 sentences, warm and natural. If user mentions a task add it to todo. Return JSON: {text, pose, action, todoUpdate}`;
+      const personaGuidelines = profile!.companion === "Mala" 
+        ? "Mala is warm, caring, and soothing. She speaks like a gentle older sister or a kind mentor. She prioritizes mental wellbeing and gentle encouragement. Use poses: idle, wave (greeting), thumbsup (affirmation), remind (task focus)."
+        : "Joseph is energetic, motivational, and direct. He speaks like a high-performance coach. He pushes the user to be their best self and focus on goals. Use poses: idle, fist (motivation), point (direction), arms (confidence).";
+
+      const systemPrompt = `
+        You are ${companion.name}. ${personaGuidelines}
+        
+        USER CONTEXT:
+        - Name: ${profile!.name}
+        - Occupation: ${profile!.occupation}
+        - Life Rhythm: Wakes at ${profile!.wakeTime}, peak focus at ${profile!.peakTime}
+        - Personal: ${profile!.relationship} status
+        - Preferences: Wants ${profile!.reminderStyle} reminders
+        
+        CURRENT STATE:
+        - Time: ${new Date().toLocaleTimeString()}
+        - Todos: ${todos.map(t => t.text).join(", ")}
+        
+        CONSTRAINTS:
+        - Responses MUST be 2-3 sentences max.
+        - Stay strictly in character.
+        - If the user mentions a new task, explicitly add it to the 'todoUpdate' array in the JSON.
+        - Output ONLY valid JSON in this format: {"text": "...", "pose": "...", "action": "...", "todoUpdate": ["task1", "task2"]}
+      `;
       
-      const chatResponse = await axios.post("/api/chat", {
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: transcript }
-        ]
+      const chatResRaw = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://dawnmind.vercel.app",
+          "X-Title": "DawnMind"
+        },
+        body: JSON.stringify({
+          model: "meta-llama/llama-3.3-70b-instruct:free",
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: transcript }
+          ],
+          max_tokens: 200
+        })
       });
 
-      const aiRes: AIResponse = JSON.parse(chatResponse.data.choices[0].message.content);
+      const chatData = await chatResRaw.json();
+      let content = chatData.choices[0].message.content;
+      
+      // Resilient JSON parsing
+      let aiRes: AIResponse;
+      try {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          aiRes = JSON.parse(jsonMatch[0]);
+        } else {
+          throw new Error("No JSON found in response");
+        }
+      } catch (parseErr) {
+        aiRes = {
+          text: content.length > 200 ? content.slice(0, 200) + "..." : content,
+          pose: "idle",
+          action: "none"
+        };
+      }
       
       // Update Todos if any
       if (aiRes.todoUpdate && aiRes.todoUpdate.length > 0) {
@@ -168,15 +197,30 @@ export default function App() {
         saveTodos(newTodos);
       }
 
-      // 3. TTS
+      // 2. TTS (Direct ElevenLabs)
       setPose(aiRes.pose || "idle");
       setStatus("speaking");
-      const ttsResponse = await axios.post("/api/tts", {
-        text: aiRes.text,
-        voiceId: companion.voiceId
-      }, { responseType: "blob" });
+      
+      const ttsResRaw = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${companion.voiceId}`, {
+        method: "POST",
+        headers: {
+          "xi-api-key": import.meta.env.VITE_ELEVENLABS_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text: aiRes.text,
+          model_id: "eleven_turbo_v2_5",
+          voice_settings: {
+            stability: 0.75,
+            similarity_boost: 0.75,
+            speed: 0.82,
+            style: 0.35
+          }
+        })
+      });
 
-      const audioUrl = URL.createObjectURL(ttsResponse.data);
+      const audioBlob = await ttsResRaw.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
       audioPlayerRef.current = audio;
       audio.onended = () => {
