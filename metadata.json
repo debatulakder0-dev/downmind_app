@@ -1,0 +1,10 @@
+{
+  "name": "DawnMind",
+  "description": "A voice-first AI morning companion that greets you, manages your tasks, and motivates you through natural conversation.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
